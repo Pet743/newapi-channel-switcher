@@ -2,6 +2,7 @@ services:
   newapi-channel-switcher:
     build:
       context: .
+      network: host
       args:
         HTTP_PROXY: ${DOWNLOAD_PROXY:-}
         HTTPS_PROXY: ${DOWNLOAD_PROXY:-}
