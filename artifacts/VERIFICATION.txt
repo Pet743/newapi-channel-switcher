@@ -1,0 +1,26 @@
+changed_branch=Gpt稳定分组（推荐）备用线路！
+changed_field=active_channel_id
+original_sha256=34f3e6ca7852b22185ffc2319be89127a6fe1163f681b63e0c66e27846b9147f
+MODIFIED_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/MODIFIED_FILE
+DIFF_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/DIFF_FILE
+VERIFICATION_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/VERIFICATION.txt
+ROLLBACK_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/ROLLBACK.sh
+
+BASELINE_COMMAND=python3 -c 'import json; d=json.load(open("artifacts/MODIFIED_FILE.baseline")); print("baseline_active="+str(d["active_channel_id"]))'
+BASELINE_INPUT=artifacts/MODIFIED_FILE.baseline
+BASELINE_OUTPUT=baseline_active=48
+BASELINE_EXIT_STATUS=0
+
+MODIFIED_COMMAND=python3 -c 'import json; d=json.load(open("artifacts/MODIFIED_FILE")); print("modified_active="+str(d["active_channel_id"]))'
+MODIFIED_INPUT=artifacts/MODIFIED_FILE
+MODIFIED_OUTPUT=modified_active=54
+MODIFIED_EXIT_STATUS=0
+
+ROLLBACK_COMMAND=artifacts/ROLLBACK.sh /tmp/MODIFIED_FILE.rollback-copy
+ROLLBACK_INPUT=/tmp/MODIFIED_FILE.rollback-copy (copy of MODIFIED_FILE)
+ROLLBACK_OUTPUT=restored=/tmp/MODIFIED_FILE.rollback-copy
+ROLLBACK_EXIT_STATUS=0
+RESTORED_COMMAND=python3 -c 'import json; d=json.load(open("/tmp/MODIFIED_FILE.rollback-copy")); print("restored_active="+str(d["active_channel_id"]))'
+RESTORED_OUTPUT=restored_active=48
+RESTORED_EXIT_STATUS=0
+restored_behavior=active_channel_id restored to 48 on rollback copy; MODIFIED_FILE remains changed at 54

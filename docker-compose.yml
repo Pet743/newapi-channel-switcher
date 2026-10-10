@@ -1,0 +1,26 @@
+services:
+  newapi-channel-switcher:
+    build: .
+    container_name: newapi-channel-switcher
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "0.0.0.0:19041:19041"
+    volumes:
+      - ./data:/app/data
+      - /opt/newapi-rc40/logs:/var/lib/newapi/logs:ro
+    networks:
+      - newapi-rc40-private
+      - newapi-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:19041/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+networks:
+  newapi-rc40-private:
+    external: true
+    name: newapi-rc40-private
+  newapi-network:
+    external: true
+    name: newapi-network

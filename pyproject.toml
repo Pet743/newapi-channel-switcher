@@ -1,0 +1,9 @@
+[project]
+name = "newapi-channel-switcher"
+version = "0.1.0"
+description = "newapi 渠道切换伴生服务"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+newapi-channel-switcher = "src.app:main"
