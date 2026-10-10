@@ -41,3 +41,6 @@ DOMAIN_ROUTE=/qudao sidecar route removed; Caddy validated and reloaded
 LIVE_TEST=model=gpt-6.1-sol channel=54 status=200 success=true elapsed_ms=1773
 BROWSER_RESULT=create/save/reload/test=PASS; desktop=1440px mobile=375px horizontal_overflow=false errors=0
 GITHUB=https://github.com/Pet743/newapi-channel-switcher
+
+V2_DOWNLOAD_BUILD=host network via 127.0.0.1:18080; pip dependency installation completed in 5.9 seconds; build_exit_status=0
+GITHUB_CI=19 tests passed in GitHub Actions
