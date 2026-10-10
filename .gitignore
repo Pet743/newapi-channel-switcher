@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
+LOGIN.txt
+artifacts/*.png
+artifacts/Caddyfile*

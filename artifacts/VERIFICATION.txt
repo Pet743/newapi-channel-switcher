@@ -1,26 +1,43 @@
-changed_branch=Gpt稳定分组（推荐）备用线路！
-changed_field=active_channel_id
-original_sha256=34f3e6ca7852b22185ffc2319be89127a6fe1163f681b63e0c66e27846b9147f
+changed_branch=SwitchEngine._choose / handle_503 / reconcile
+changed_fields=groups_config.current_channel_id / channels.status / abilities.enabled
+original_sha256=0571aa00a3dd7b2a71b79173c8a5d270e8137815897da1eb004924cdbd2fc82f
 MODIFIED_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/MODIFIED_FILE
 DIFF_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/DIFF_FILE
 VERIFICATION_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/VERIFICATION.txt
 ROLLBACK_FILE=/Users/mks/Documents/ChatGPT/newapi自适应切换渠道/artifacts/ROLLBACK.sh
 
-BASELINE_COMMAND=python3 -c 'import json; d=json.load(open("artifacts/MODIFIED_FILE.baseline")); print("baseline_active="+str(d["active_channel_id"]))'
-BASELINE_INPUT=artifacts/MODIFIED_FILE.baseline
-BASELINE_OUTPUT=baseline_active=48
+BASELINE_COMMAND=python3 artifacts/verify_behavior.py BASELINE
+BASELINE_INPUT=artifacts/ORIGINAL_FILE.core.py; channels 48(status=1,priority=100),54(status=2,priority=90); 503 on 48
+BASELINE_OUTPUT=BASELINE switch=54 recovery=54 single_active=1
 BASELINE_EXIT_STATUS=0
-
-MODIFIED_COMMAND=python3 -c 'import json; d=json.load(open("artifacts/MODIFIED_FILE")); print("modified_active="+str(d["active_channel_id"]))'
-MODIFIED_INPUT=artifacts/MODIFIED_FILE
-MODIFIED_OUTPUT=modified_active=54
+MODIFIED_COMMAND=python3 artifacts/verify_behavior.py MODIFIED
+MODIFIED_INPUT=src/core.py; same initial channels; 503 followed by recovered high-priority probe
+MODIFIED_OUTPUT=MODIFIED switch=54 recovery=48 single_active=1
 MODIFIED_EXIT_STATUS=0
-
-ROLLBACK_COMMAND=artifacts/ROLLBACK.sh /tmp/MODIFIED_FILE.rollback-copy
-ROLLBACK_INPUT=/tmp/MODIFIED_FILE.rollback-copy (copy of MODIFIED_FILE)
-ROLLBACK_OUTPUT=restored=/tmp/MODIFIED_FILE.rollback-copy
+ROLLBACK_COMMAND=sh artifacts/ROLLBACK.sh /tmp/core.rollback.py
+ROLLBACK_INPUT=/tmp/core.rollback.py (real copy of MODIFIED_FILE)
+ROLLBACK_OUTPUT=restored=/tmp/core.rollback.py
 ROLLBACK_EXIT_STATUS=0
-RESTORED_COMMAND=python3 -c 'import json; d=json.load(open("/tmp/MODIFIED_FILE.rollback-copy")); print("restored_active="+str(d["active_channel_id"]))'
-RESTORED_OUTPUT=restored_active=48
+RESTORED_COMMAND=python3 artifacts/verify_behavior.py ROLLBACK /tmp/core.rollback.py
+RESTORED_OUTPUT=ROLLBACK switch=54 recovery=54 single_active=1
 RESTORED_EXIT_STATUS=0
-restored_behavior=active_channel_id restored to 48 on rollback copy; MODIFIED_FILE remains changed at 54
+restored_behavior=rollback copy hash and original behavior restored; MODIFIED_FILE stays changed
+
+POSTGRES_COMMAND=docker compose exec -T newapi-channel-switcher python - < artifacts/verify_postgres.py
+POSTGRES_INPUT=isolated temporary PostgreSQL schema with synthetic channels 48 and 54; production channels untouched
+POSTGRES_OUTPUT=BASELINE 48:1:true 54:2:false
+POSTGRES_OUTPUT=MODIFIED 48:2:false 54:1:true
+POSTGRES_OUTPUT=RECOVERY 48:1:true 54:2:false
+POSTGRES_OUTPUT=ROLLBACK 48:1:true 54:2:false paused=true
+POSTGRES_OUTPUT=TRANSACTION failure=rolled_back
+POSTGRES_OUTPUT=ISOLATED_SCHEMA removed=true production_channels=unchanged
+POSTGRES_EXIT_STATUS=0
+
+UNIT_COMMAND=python3 -m unittest discover -s tests -v
+UNIT_RESULT=19 tests passed; exit_status=0
+DEPLOYMENT=43.248.139.184:19041; healthy; HTTP /, /api/groups, /api/channels = 200 with auth; unauthenticated / = 401
+DEPLOYMENT_PATH=/opt/newapi-channel-switcher
+DOMAIN_ROUTE=/qudao sidecar route removed; Caddy validated and reloaded
+LIVE_TEST=model=gpt-6.1-sol channel=54 status=200 success=true elapsed_ms=1773
+BROWSER_RESULT=create/save/reload/test=PASS; desktop=1440px mobile=375px horizontal_overflow=false errors=0
+GITHUB=https://github.com/Pet743/newapi-channel-switcher

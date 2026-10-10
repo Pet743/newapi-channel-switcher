@@ -28,7 +28,7 @@ class PostgresChannelRepository:
 
     def get_channels(self, ids: Iterable[int] | None = None) -> list[Channel]:
         with self._connect() as conn:
-            if ids:
+            if ids is not None:
                 id_list = list(ids)
                 with conn.cursor() as cur:
                     cur.execute(f"SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ANY(%s) ORDER BY id", (id_list,))
@@ -53,6 +53,18 @@ class PostgresChannelRepository:
                     raise ValueError("目标渠道不在分组")
                 cur.execute("UPDATE channels SET status=2 WHERE id = ANY(%s)", (channel_ids,))
                 cur.execute("UPDATE channels SET status=1 WHERE id=%s", (active_id,))
+                cur.execute("UPDATE abilities SET enabled=(channel_id=%s) WHERE channel_id = ANY(%s)", (active_id, channel_ids))
+            conn.commit()
+
+    def restore_statuses(self, statuses):
+        with self.lock, self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM channels WHERE id = ANY(%s) FOR UPDATE", (list(statuses),))
+                if {r[0] for r in cur.fetchall()} != set(statuses):
+                    raise ValueError("快照中的渠道已被删除，请核对后恢复")
+                for cid, status in statuses.items():
+                    cur.execute("UPDATE channels SET status=%s WHERE id=%s", (status, cid))
+                    cur.execute("UPDATE abilities SET enabled=%s WHERE channel_id=%s", (status == 1, cid))
             conn.commit()
 
 
@@ -82,10 +94,16 @@ class UpstreamTester:
         req = urllib.request.Request(channel.base_url.rstrip("/") + "/v1/chat/completions", data=payload, method="POST", headers={"Authorization": f"Bearer {channel.key}", "Content-Type": "application/json", "User-Agent": "newapi-channel-switcher/0.1"})
         status = None
         detail = ""
+        valid = False
         try:
             with opener.open(req, timeout=self.timeout) as response:
                 status = response.status
-                detail = response.read(500).decode("utf-8", "replace")
+                detail = response.read(65536).decode("utf-8", "replace")
+                try:
+                    data = json.loads(detail)
+                    valid = isinstance(data, dict) and not data.get("error") and bool(data.get("choices") or data.get("output"))
+                except ValueError:
+                    valid = False
         except urllib.error.HTTPError as exc:
             status = exc.code
             try:
@@ -95,5 +113,7 @@ class UpstreamTester:
         except Exception as exc:
             detail = str(exc)
         elapsed = int((time.monotonic() - started) * 1000)
-        # 只把明确的 2xx 视为可用，避免将 401/404 渠道切成当前渠道。
-        return CandidateResult(channel.id, status, elapsed, bool(status and 200 <= status < 300), detail[:500])
+        detail = detail.replace(channel.key, "[redacted]")
+        if proxy:
+            detail = detail.replace(proxy, "[proxy]")
+        return CandidateResult(channel.id, status, elapsed, bool(status and 200 <= status < 300 and valid), detail[:500])
