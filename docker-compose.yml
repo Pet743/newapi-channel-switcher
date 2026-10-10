@@ -1,6 +1,10 @@
 services:
   newapi-channel-switcher:
-    build: .
+    build:
+      context: .
+      args:
+        HTTP_PROXY: ${DOWNLOAD_PROXY:-}
+        HTTPS_PROXY: ${DOWNLOAD_PROXY:-}
     container_name: newapi-channel-switcher
     restart: unless-stopped
     env_file: .env

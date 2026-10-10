@@ -17,6 +17,7 @@
 ```bash
 cp .env.example .env
 # 填写 NEWAPI_DB_DSN、ADMIN_PASSWORD
+# 如使用服务器v2节点，在DOWNLOAD_PROXY填写HTTP代理地址（含认证信息）。
 
 docker compose up -d --build
 ```
