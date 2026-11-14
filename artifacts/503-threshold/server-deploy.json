@@ -1,0 +1,5 @@
+{
+  "stdout": "SQLite backup completed\nrunning healthy sha256:6fdd026f87f7e45af78f6bef675eb11df245576b395974a21d8af65f00e69fa2\n[{'id': 3, 'name': 'gpt', 'enabled': 1, 'current_channel_id': 59, 'error_window_seconds': 5, 'error_threshold': 3}]\n{\"ok\": true, \"service\": \"newapi渠道切换\"}",
+  "stderr": " Container newapi-channel-switcher  Recreate\n Container newapi-channel-switcher  Recreated\n Container newapi-channel-switcher  Starting\n Container newapi-channel-switcher  Started\n Container newapi-channel-switcher  Waiting\n Container newapi-channel-switcher  Healthy\n",
+  "exit": 0
+}
