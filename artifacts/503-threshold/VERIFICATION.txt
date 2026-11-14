@@ -1,0 +1,103 @@
+分支：codex/group-503-threshold
+提交：88ee497
+PR：https://github.com/Pet743/newapi-channel-switcher/pull/1
+修改字段：groups_config.error_window_seconds=5；groups_config.error_threshold=3。
+修改分支：SwitchEngine.handle_503 达到阈值才调用 _choose；按分组及当前渠道计数。
+线上：分组 #3 gpt 已启用 5 秒 3 次；HTTP 保存规则成功 200，非法次数返回 400；running healthy。
+统计：按日志时间的滚动窗口（包含恰好5秒边界）；同一请求ID+渠道去重；切换、暂停、恢复、保存规则重新计数。
+回滚：只在独立副本验证；副本恢复遇到一次503即触发行为。线上和 MODIFIED_FILE 保持修改后状态。
+
+四个本地绝对路径：
+/Users/mks/Documents/ChatGPT/策略/newapi-channel-switcher/artifacts/503-threshold/MODIFIED_FILE
+/Users/mks/Documents/ChatGPT/策略/newapi-channel-switcher/artifacts/503-threshold/DIFF_FILE
+/Users/mks/Documents/ChatGPT/策略/newapi-channel-switcher/artifacts/503-threshold/VERIFICATION.txt
+/Users/mks/Documents/ChatGPT/策略/newapi-channel-switcher/artifacts/503-threshold/ROLLBACK.sh
+
+服务器四个路径均位于 /opt/newapi-channel-switcher/artifacts/503-threshold/，文件名同上。
+
+BASELINE
+cwd: /opt/newapi-channel-switcher
+command: PYTHONPATH=artifacts/503-threshold/original python3 artifacts/503-threshold/probe.py
+input: channel_id=1,status=503,times=[100,102,104]；当前渠道1，备选2，备选测试200。
+literal stdout: {"input":{"channel_id":1,"status":503,"times":[100,102,104]},"active_after_each":[2,2,2]}
+exit: 0
+result: 第一次503即切到2。
+
+MODIFIED
+cwd: /opt/newapi-channel-switcher
+command: PYTHONPATH=. python3 artifacts/503-threshold/probe.py
+input: channel_id=1,status=503,times=[100,102,104]；当前渠道1，备选2，备选测试200；默认5秒3次。
+literal stdout: {"input":{"channel_id":1,"status":503,"times":[100,102,104]},"active_after_each":[1,1,2]}
+exit: 0
+result: 前两次保持1，第三次切到2。
+
+ROLLBACK
+cwd: /opt/newapi-channel-switcher
+command: artifacts/503-threshold/ROLLBACK.sh /tmp/channel-switcher-rollback-20261114
+input: 独立副本路径 /tmp/channel-switcher-rollback-20261114
+literal stdout: ROLLBACK copy restored: original source and immediate-on-503 behavior
+exit: 0
+command: PYTHONPATH=/tmp/channel-switcher-rollback-20261114 python3 artifacts/503-threshold/probe.py
+input: channel_id=1,status=503,times=[100,102,104]；当前渠道1，备选2，备选测试200。
+literal stdout: {"input":{"channel_id":1,"status":503,"times":[100,102,104]},"active_after_each":[2,2,2]}
+exit: 0
+restored behavior/status: 副本恢复第一次503即切到2；原版core.py SHA-256为c74c865dff572bdb61e12079dade5724dc272bae0e6d05adb9310b959f7d7aeb。
+
+服务部署回滚命令（已准备，未在线上执行）：
+/opt/newapi-channel-switcher/artifacts/503-threshold/ROLLBACK.sh --deployment
+恢复原镜像和源文件，保留线上SQLite配置及事件；旧代码忽略新增列。
+
+测试与检查：
+BASELINE command: python3 -m unittest discover -s tests -v
+literal stderr:
+test_activation_tries_all_by_priority (test_core.TestCore.test_activation_tries_all_by_priority) ... ok
+test_log_rotation_and_partial_lines (test_core.TestCore.test_log_rotation_and_partial_lines) ... ok
+test_log_watcher_survives_callback_failure (test_core.TestCore.test_log_watcher_survives_callback_failure) ... ok
+test_no_candidate_retains_state (test_core.TestCore.test_no_candidate_retains_state) ... ok
+test_parser_503_only (test_core.TestCore.test_parser_503_only) ... ok
+test_paused_ignored (test_core.TestCore.test_paused_ignored) ... ok
+test_periodic_does_not_test_current (test_core.TestCore.test_periodic_does_not_test_current) ... ok
+test_public_does_not_include_secrets (test_core.TestCore.test_public_does_not_include_secrets) ... ok
+test_restore_higher_priority (test_core.TestCore.test_restore_higher_priority) ... ok
+test_rollback_original_statuses (test_core.TestCore.test_rollback_original_statuses) ... ok
+test_skip_failing_high_candidate (test_core.TestCore.test_skip_failing_high_candidate) ... ok
+test_stale_event_ignored (test_core.TestCore.test_stale_event_ignored) ... ok
+test_switch_priority_success (test_core.TestCore.test_switch_priority_success) ... ok
+test_unique_channel_management (test_core.TestCore.test_unique_channel_management) ... ok
+test_channels_export_no_secrets (test_http.TestHTTP.test_channels_export_no_secrets) ... ok
+test_health (test_http.TestHTTP.test_health) ... ok
+test_html_requires_auth (test_http.TestHTTP.test_html_requires_auth) ... ok
+test_errors_rejected (test_newapi.TestNewAPI.test_errors_rejected) ... ok
+test_simple_payload (test_newapi.TestNewAPI.test_simple_payload) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 3.796s
+
+OK
+exit: 0
+MODIFIED command: docker exec -i newapi-channel-switcher python < artifacts/503-threshold/verify_live.py && python3 -m unittest discover -s tests -q && python3 -m compileall -q -x '/\._' src && sha256sum src/core.py artifacts/503-threshold/MODIFIED_FILE && docker inspect -f '{{.State.Status}} {{.State.Health.Status}}' newapi-channel-switcher
+literal stdout:
+{"group_id":3,"name":"gpt","error_window_seconds":5,"error_threshold":3,"enabled":1,"current_channel_id":48,"html_rule_form":true,"save_rule_status":200}
+invalid_threshold_status=400
+60f78fe54f5313b6c9a48988d4ec9cb3793813a221aeb09c6f985e8df9f59f8a  src/core.py
+60f78fe54f5313b6c9a48988d4ec9cb3793813a221aeb09c6f985e8df9f59f8a  artifacts/503-threshold/MODIFIED_FILE
+running healthy
+literal stderr:
+----------------------------------------------------------------------
+Ran 29 tests in 5.331s
+
+OK
+exit: 0
+
+服务器源目录包含此前存在的 macOS ._* 元数据文件；直接 compileall 扫到这些文件会失败，排除 /\._ 后编译通过；Docker 构建原有 .dockerignore 已排除 ._*。
+
+浏览器验证：本地预览保存8秒4次后，另一分组仍为10秒4次；改回5秒3次成功。截图UI-verification.png。前端脚本执行node --check通过（exit 0）。
+
+修改文件SHA-256：
+60f78fe54f5313b6c9a48988d4ec9cb3793813a221aeb09c6f985e8df9f59f8a  src/core.py
+48b33d64b2223deeaabd65063c954c4dfbbf45640bab3cedfd5e947d112232c1  src/store.py
+404087dac2d8421b44917ec7223b851a452d045ea91defd9429fc35b3e8e0124  src/app.py
+038f5dab98318f24c456c6250b1d2ae1627457a4ce75398cd3ebff4189cb50cd  static/index.html
+dddb58b6e4331163d7d0819837c9eb854ff384664456cfa898d11ccd7d5574fd  README.md
+6b271d4eac7e5ac4476f04ac63a79fb0bcb321c3b32a7aeef7bf66ae9270615a  tests/test_core.py
+b9da75757bc3e2049a8c2385b1fb2050d79144c917ec5e2c85ba58b3249d6893  tests/test_error_rule.py

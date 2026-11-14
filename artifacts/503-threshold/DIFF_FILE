@@ -1,0 +1,510 @@
+diff --git a/README.md b/README.md
+index 2e92544..58c926c 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # newapi渠道切换
+ 
+-独立的 newapi 伴生服务。它通过 PostgreSQL 读取渠道，通过 newapi 日志捕获 `status_code=503`，并按后台配置的分组和优先级自动切换。每个分组只保持一个渠道启用：触发 503 后，服务从优先级最高的候选开始用 `gpt-6.1-sol` 发起最小测试请求，只有返回 2xx 才关闭当前渠道并启用候选渠道。
++独立的 newapi 伴生服务。它通过 PostgreSQL 读取渠道，通过 newapi 日志捕获 `status_code=503`，并按后台配置的分组和优先级自动切换。每个分组只保持一个渠道启用：当前渠道在配置的滚动窗口内累计 503 达到阈值后（默认 5 秒 3 次），服务从优先级最高的候选开始用 `gpt-6.1-sol` 发起最小测试请求，只有返回 2xx 才关闭当前渠道并启用候选渠道。
+ 
+ ## 功能
+ 
+@@ -34,7 +34,7 @@ docker compose up -d --build
+ 1. 访问 `http://43.248.139.184:19041/`，输入 `.env` 中的 Basic Auth 用户名和密码。
+ 2. 新建分组，选择渠道并填写优先级，点击“保存渠道配置”。
+ 3. “测试”只验证该渠道的 `gpt-6.1-sol` 请求；“启用并选优”按最高优先级逐个测试，首个成功渠道作为唯一启用渠道。
+-4. 检测到当前渠道的 503 后立即测试其他候选；定时探测更高优先级渠道（默认60秒），恢复后自动回切。所有候选失败时保留当前状态并记录失败。
++4. 在分组内保存“503 切换规则”（统计窗口秒数、触发次数），当前渠道在滚动窗口内达到次数后才测试其他候选；定时探测更高优先级渠道（默认60秒），恢复后自动回切。所有候选失败时保留当前状态并记录失败。
+ 5. “暂停”停止接管；“恢复接管前状态”把该分组保存的原始启停状态恢复到 newapi。修改渠道前先暂停，删除前建议先恢复。
+ 
+ ## API
+@@ -43,6 +43,7 @@ docker compose up -d --build
+ - `GET /api/channels`：读取 newapi 渠道（密钥不会返回）。
+ - `POST /api/groups`：提交 `{"name":"备用线路","newapi_group":"newapi中的分组名称"}` 新建分组。
+ - `POST /api/groups/{id}/channels`：提交 `{"channels":[{"channel_id":48,"priority":100}]}`。
++- `POST /api/groups/{id}/error-rule`：提交 `{"error_window_seconds":5,"error_threshold":3}`，仅修改此分组的 503 规则，立即生效并重置计数。窗口为 1～86400 秒，次数为 1～10000，均为整数；设为 1 次可恢复遇到一次即触发。
+ - `POST /api/groups/{id}/activate`：提交 `{}`，按优先级选优，测试成功后单活启用。
+ - `POST /api/groups/{id}/restore`：提交 `{}`，恢复快照并暂停。
+ - `POST /api/test-channel`：提交 `{"channel_id":48}`，手动测试。
+@@ -65,6 +66,7 @@ python3 -m compileall -q src
+ - 渠道必须归属所选的单一newapi分组；同一个渠道不能由两个伴生分组共同管理。已有启用渠道需全部纳入，保证分组单活。
+ - `channels.status`与`abilities.enabled`在同一PostgreSQL事务中修改。newapi内存路由缓存按自身同步周期更新；当前实例约30秒。已经发出的请求不重放，客户端下次请求使用新渠道。
+ - 简单测试使用渠道自身base_url/key及代理设置，发送chat/completions非流式请求；要求2xx且有正常choices/output。HTTP401、404、429、503、网络错误、HTTP200错误体都不会被判定为成功。当前实现针对OpenAI兼容渠道，不是所有newapi适配器的复刻。
++- 每个分组独立计数，仅统计当前渠道；切换渠道、保存规则、暂停或恢复时清空计数。规则持久化到 SQLite，已有分组自动补充默认 5 秒 3 次；服务重启清空内存计数。按日志时间计算滚动窗口，同一请求 ID 在同一渠道的两种 503 日志只计一次（保留最近 50000 个去重键）；没有请求 ID 的日志按行计数，没有时间戳的日志按接收时间计数。
+ - 首次启动跳过历史日志，新日志轮转从头读取；只消费完整行，迟到的备用渠道503不会覆盖当前渠道。
+ - 更高优先级探测会产生少量上游调用费用。默认60秒一次，使用RECOVERY_INTERVAL调整。
+ - 后台独立Basic Auth，ADMIN_PASSWORD必填；数据库密钥、渠道密钥和代理凭证不返回到浏览器。
+diff --git a/src/app.py b/src/app.py
+index d82bae4..07c2398 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -26,7 +26,7 @@ class Service:
+         self.worker = None
+ 
+     def record_event(self, event): self.store.add_event(json.dumps(event, ensure_ascii=False))
+-    def on_503(self, cid, message): self.engine.handle_503(cid,message)
++    def on_503(self, cid, message, occurred_at=None): self.engine.handle_503(cid,message,occurred_at=occurred_at)
+     def start(self):
+         self.watcher.start()
+         self.worker = threading.Thread(target=self._periodic,daemon=True,name='recovery-worker')
+@@ -112,19 +112,31 @@ class Handler(BaseHTTPRequestHandler):
+                 if path=='/api/groups':
+                     newapi_group=str(body.get('newapi_group',''))
+                     if not newapi_group: raise ValueError('请选择newapi分组')
+-                    return self._json(201,store.create_group(str(body.get('name','')),newapi_group))
++                    return self._json(201,store.create_group(str(body.get('name','')),newapi_group,
++                                                           body.get('error_window_seconds',5),body.get('error_threshold',3)))
+                 if path.startswith('/api/groups/'):
+                     parts=path.strip('/').split('/');gid=int(parts[2]);g=store.get_group(gid)
+                     if not g: return self._json(404,{'error':'分组不存在'})
+                     action=parts[3] if len(parts)==4 else None
+-                    if action=='channels': return self._json(200,{'channels':service.validate_candidates(gid,body.get('channels'))})
++                    if action=='channels':
++                        channels=service.validate_candidates(gid,body.get('channels'))
++                        service.engine.reset_error_window(gid)
++                        return self._json(200,{'channels':channels})
++                    if action=='error-rule':
++                        rule=store.update_group(gid,error_window_seconds=body['error_window_seconds'],error_threshold=body['error_threshold'])
++                        service.engine.reset_error_window(gid)
++                        service.record_event({'type':'rule_updated','group_id':gid,'group_name':g['name'],
++                                              'detail':f"503切换规则：{rule['error_window_seconds']}秒内达到{rule['error_threshold']}次"})
++                        return self._json(200,rule)
+                     if action=='activate':
+                         # 所有候选按优先级逐一测试，不直接按指定ID绕过优先级。
+                         return self._json(200,service.engine.activate_best(gid))
+                     if action=='restore': service.engine.restore(gid);return self._json(200,{'ok':True})
+                     if action is None:
+                         if body.get('enabled'): raise ValueError('请点击启用并选优以完成测试后启用')
+-                        return self._json(200,store.update_group(gid,body.get('name'),body.get('enabled')))
++                        updated=store.update_group(gid,body.get('name'),body.get('enabled'))
++                        if 'enabled' in body: service.engine.reset_error_window(gid)
++                        return self._json(200,updated)
+                 if path=='/api/test-channel':
+                     cid=int(body['channel_id']);channel=next(iter(service.repository.get_channels([cid])),None)
+                     if not channel: return self._json(404,{'error':'渠道不存在'})
+@@ -142,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
+                 gid=int(path.split('/')[3]);g=service.store.get_group(gid)
+                 if not g: return self._json(404,{'error':'分组不存在'})
+                 if g['enabled']: raise ValueError('请先暂停或恢复再删除分组')
+-                service.store.delete_group(gid);self._json(200,{'ok':True})
++                service.store.delete_group(gid);service.engine.reset_error_window(gid);self._json(200,{'ok':True})
+         except ValueError as exc: self._json(400,{'error':str(exc)})
+     def log_message(self,fmt,*args): logging.info(fmt,*args)
+ 
+diff --git a/src/core.py b/src/core.py
+index 6d9ba60..d7cefd6 100644
+--- a/src/core.py
++++ b/src/core.py
+@@ -4,12 +4,15 @@ import logging
+ import re
+ import threading
+ import time
++from collections import OrderedDict
+ from dataclasses import dataclass
++from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Callable, Iterable, Protocol
+ 
+ ERROR_RE = re.compile(r"record error log:.*?channelId=(\d+).*?content=status_code=503(?:\D|$)(.*)")
+ CHANNEL_ERROR_RE = re.compile(r"channel error \(channel #(\d+), status code: 503\):\s*(.*)")
++LOG_CONTEXT_RE = re.compile(r'^\[\w+\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2})\s*\|\s*([^|]+?)\s*\|')
+ 
+ @dataclass(frozen=True)
+ class Channel:
+@@ -46,6 +49,18 @@ class LogParser:
+         match = ERROR_RE.search(line) or CHANNEL_ERROR_RE.search(line)
+         return (int(match[1]), match[2].strip()) if match else None
+ 
++    @staticmethod
++    def context(line):
++        match = LOG_CONTEXT_RE.search(line)
++        if not match: return None, None
++        try:
++            # 日志时区不影响滚动窗口的时间差；统一解析，避免依赖容器时区。
++            timestamp = datetime.strptime(match[1], '%Y/%m/%d - %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
++        except ValueError:
++            return None, None
++        request_id = match[2].strip()
++        return timestamp, request_id if request_id and request_id != '-' else None
++
+ class LogWatcher:
+     """首次跳过历史；新文件从头读；只处理已完整写入的行。"""
+     def __init__(self, directory, on_503, interval=1.0):
+@@ -55,6 +70,7 @@ class LogWatcher:
+         self._offsets = {}
+         self._initialized = False
+         self._thread = None
++        self._seen_requests = OrderedDict()
+ 
+     def start(self):
+         self.poll_once()
+@@ -91,9 +107,19 @@ class LogWatcher:
+                     if not line or not line.endswith(b"\n"): break
+                     # 故障切换失败仍消费本行，由定时探测重试，避免不停重放。
+                     self._offsets[key] = fh.tell()
+-                    parsed = LogParser.parse(line.decode("utf-8", "replace"))
++                    text = line.decode("utf-8", "replace")
++                    parsed = LogParser.parse(text)
+                     if parsed:
+-                        try: self.on_503(*parsed)
++                        timestamp, request_id = LogParser.context(text)
++                        # 同一请求的 channel error / record error log 只统计一次。
++                        if request_id:
++                            request_key = (parsed[0], request_id)
++                            if request_key in self._seen_requests: continue
++                            self._seen_requests[request_key] = None
++                            if len(self._seen_requests) > 50000: self._seen_requests.popitem(last=False)
++                        try:
++                            if timestamp is None: self.on_503(*parsed)
++                            else: self.on_503(*parsed, occurred_at=timestamp)
+                         except Exception: logging.exception("503 事件处理失败")
+                 self._offsets.setdefault(key, offset)
+         self._offsets = {k: v for k, v in self._offsets.items() if k in live}
+@@ -106,6 +132,10 @@ class SwitchEngine:
+         self.lock = threading.RLock()
+         self._lock = self.lock
+         self._failed_until = {}
++        self._error_windows = {}
++
++    def reset_error_window(self, group_id):
++        with self.lock: self._error_windows.pop(group_id, None)
+ 
+     def _test(self, group, channel, reason):
+         result = self.tester(channel)
+@@ -136,6 +166,7 @@ class SwitchEngine:
+             if not result.success: continue
+             self.repository.set_active(ids, cid)
+             self.config_store.set_current(group["id"], cid)
++            if cid != current: self.reset_error_window(group["id"])
+             self.config_store.update_group(group["id"], enabled=True)
+             event = {"type": "switched", "group_id": group["id"], "group_name": group["name"],
+                      "failed_channel_id": excluded, "previous_channel_id": current,
+@@ -149,16 +180,32 @@ class SwitchEngine:
+                          "reason": reason, "success": False, "detail": "候选渠道全部测试失败，保留当前状态，等待下一轮探测"})
+         return {"success": False, "active_channel_id": current, "changed": False}
+ 
+-    def handle_503(self, channel_id, message):
++    def handle_503(self, channel_id, message, occurred_at=None):
+         results = []
+         with self.lock:
+             for group in self.config_store.groups_for_channel(channel_id):
+                 # 忽略旧请求/备用渠道迟到的错误，不覆盖正在使用的成功渠道。
+                 if group["current_channel_id"] != channel_id: continue
+-                self._failed_until[channel_id] = time.time() + self.cooldown
++                window, threshold = group['error_window_seconds'], group['error_threshold']
++                signature = (channel_id, window, threshold)
++                state = self._error_windows.get(group['id'])
++                if state is None or state['signature'] != signature:
++                    state = {'signature': signature, 'times': []}
++                    self._error_windows[group['id']] = state
++                timestamp = time.time() if occurred_at is None else occurred_at
++                latest = max(timestamp, max(state['times'], default=timestamp))
++                state['times'] = [t for t in state['times'] if t >= latest - window]
++                if timestamp >= latest - window: state['times'].append(timestamp)
++                count = len(state['times'])
++                triggered = count >= threshold
+                 self.event_sink({"type": "503", "group_id": group["id"], "group_name": group["name"],
+-                                 "failed_channel_id": channel_id, "detail": message})
+-                results.append(self._choose(group, "检测到503", excluded=channel_id))
++                                 "failed_channel_id": channel_id, "detail": message,
++                                 "error_count": count, "error_threshold": threshold,
++                                 "error_window_seconds": window, "triggered": triggered})
++                if not triggered: continue
++                self.reset_error_window(group['id'])
++                self._failed_until[channel_id] = time.time() + self.cooldown
++                results.append(self._choose(group, f'{window}秒内503达到{threshold}次', excluded=channel_id))
+         return results
+ 
+     def activate_best(self, group_id):
+@@ -166,6 +213,7 @@ class SwitchEngine:
+             group = self.config_store.get_group(group_id)
+             if not group: raise ValueError("分组不存在")
+             if not self.config_store.candidates(group_id): raise ValueError("请先保存渠道配置")
++            self.reset_error_window(group_id)
+             self.config_store.update_group(group_id, enabled=True)
+             return self._choose(group, "启用配置", force=True)
+ 
+@@ -184,6 +232,7 @@ class SwitchEngine:
+             if not snapshot: raise ValueError("该分组没有接管快照")
+             self.repository.restore_statuses(snapshot)
+             self.config_store.update_group(group_id, enabled=False)
++            self.reset_error_window(group_id)
+             self.event_sink({"type": "restored", "group_id": group_id, "detail": "恢复接管前的渠道状态并暂停自动切换"})
+ 
+ class MemoryRepository:
+diff --git a/src/store.py b/src/store.py
+index 8af1ad8..1c6cec1 100644
+--- a/src/store.py
++++ b/src/store.py
+@@ -4,6 +4,8 @@ import threading
+ import time
+ from pathlib import Path
+ 
++_UNSET = object()
++
+ class ConfigStore:
+     def __init__(self, path="data/config.db"):
+         Path(path).parent.mkdir(parents=True, exist_ok=True)
+@@ -24,6 +26,9 @@ class ConfigStore:
+         cols = {r[1] for r in self.conn.execute('PRAGMA table_info(groups_config)')}
+         if 'newapi_group' not in cols:
+             self.conn.execute("ALTER TABLE groups_config ADD COLUMN newapi_group TEXT NOT NULL DEFAULT ''")
++        for column, default in (('error_window_seconds', 5), ('error_threshold', 3)):
++            if column not in cols:
++                self.conn.execute(f'ALTER TABLE groups_config ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}')
+         self.conn.commit()
+ 
+     def groups(self):
+@@ -32,15 +37,31 @@ class ConfigStore:
+         with self.lock:
+             r = self.conn.execute('SELECT * FROM groups_config WHERE id=?', (gid,)).fetchone()
+             return dict(r) if r else None
+-    def create_group(self, name, newapi_group=''):
++    @staticmethod
++    def validate_error_rule(error_window_seconds, error_threshold):
++        for value, limit, label in ((error_window_seconds, 86400, '503统计窗口（秒）'),
++                                    (error_threshold, 10000, '503触发次数')):
++            if type(value) is not int or not 1 <= value <= limit:
++                raise ValueError(f'{label}必须是1～{limit}的整数')
++
++    def create_group(self, name, newapi_group='', error_window_seconds=5, error_threshold=3):
+         if not name.strip() or len(name) > 128: raise ValueError('分组名称需为1～128个字符')
++        self.validate_error_rule(error_window_seconds, error_threshold)
+         with self.lock, self.conn:
+             if newapi_group and self.conn.execute('SELECT 1 FROM groups_config WHERE newapi_group=?',(newapi_group,)).fetchone():
+                 raise ValueError('该newapi分组已有管理配置，请编辑已有分组')
+-            cur = self.conn.execute('INSERT INTO groups_config(name,newapi_group,enabled,created_at) VALUES(?,?,0,?)', (name.strip(),newapi_group,int(time.time())))
++            cur = self.conn.execute('INSERT INTO groups_config(name,newapi_group,enabled,created_at,error_window_seconds,error_threshold) VALUES(?,?,0,?,?,?)',
++                                    (name.strip(),newapi_group,int(time.time()),error_window_seconds,error_threshold))
+             return self.get_group(cur.lastrowid)
+-    def update_group(self, gid, name=None, enabled=None):
++    def update_group(self, gid, name=None, enabled=None, error_window_seconds=_UNSET, error_threshold=_UNSET):
+         fields, values = [], []
++        rule = {k: v for k, v in (('error_window_seconds', error_window_seconds), ('error_threshold', error_threshold)) if v is not _UNSET}
++        if rule:
++            current = self.get_group(gid)
++            if not current: raise ValueError('分组不存在')
++            self.validate_error_rule(rule.get('error_window_seconds', current['error_window_seconds']),
++                                     rule.get('error_threshold', current['error_threshold']))
++            for key, value in rule.items(): fields.append(key+'=?'); values.append(value)
+         if name is not None:
+             if not name.strip(): raise ValueError('名称不能为空')
+             fields.append('name=?'); values.append(name.strip())
+diff --git a/static/index.html b/static/index.html
+index c41647d..94ab506 100644
+--- a/static/index.html
++++ b/static/index.html
+@@ -19,32 +19,33 @@
+ <script>
+ const $=s=>document.querySelector(s);
+ const base=new URL('./',location.href);
+-let state={groups:[],channels:[],tests:{},selected:null},dirty=false,noticeTimer,loading=false;
++let state={groups:[],channels:[],tests:{},selected:null},dirty=false,ruleDirty=false,noticeTimer,loading=false;
+ const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ function notice(text){clearTimeout(noticeTimer);$('#notice').textContent=text;$('#notice').style.display='block';noticeTimer=setTimeout(()=>$('#notice').style.display='none',7000)}
+ async function api(path,body,method){const r=await fetch(new URL('api/'+path,base),{method:method||(body?'POST':'GET'),headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});if(r.status===401)throw Error('登录已失效，请刷新页面重新登录');const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j}
+ async function busy(button,fn){button.disabled=true;try{await fn()}catch(e){notice(e.message)}finally{button.disabled=false}}
+ const selected=()=>state.groups.find(g=>g.id===state.selected);
+-async function load(){if(loading)return;loading=true;try{const [groups,channels,events]=await Promise.all([api('groups'),api('channels'),api('events')]);state.groups=groups.groups;state.channels=channels.channels;state.tests=channels.tests;renderGroups();if(!dirty)renderDetail();renderEvents(events.events);$('#health').textContent='服务在线';$('#health').className='pill good'}catch(e){notice(e.message);$('#health').textContent='连接异常';$('#health').className='pill bad'}finally{loading=false}}
++async function load(){if(loading)return;loading=true;try{const [groups,channels,events]=await Promise.all([api('groups'),api('channels'),api('events')]);state.groups=groups.groups;state.channels=channels.channels;state.tests=channels.tests;renderGroups();if(!dirty&&!ruleDirty)renderDetail();renderEvents(events.events);$('#health').textContent='服务在线';$('#health').className='pill good'}catch(e){notice(e.message);$('#health').textContent='连接异常';$('#health').className='pill bad'}finally{loading=false}}
+ function renderGroups(){$('#groups').innerHTML=state.groups.length?state.groups.map(g=>`<button class="group ${state.selected===g.id?'selected':''}" data-select="${g.id}"><strong>${esc(g.name)}</strong><small>${g.channels.length} 个渠道 · ${g.enabled?'自动切换运行中':'已暂停'}<br>当前渠道：${g.current_channel_id?'#'+g.current_channel_id:'尚未选优'}</small></button>`).join(''):'<div class="empty">暂无分组</div>'}
+ function renderDetail(){const g=selected();if(!g){$('#detail').innerHTML='<div class="empty">新建或选择一个分组开始配置</div>';return}const chosen=new Map(g.channels.map(c=>[c.channel_id,c.priority]));const channels=state.channels.filter(c=>c.group===g.newapi_group).sort((a,b)=>(chosen.get(b.id)??-Infinity)-(chosen.get(a.id)??-Infinity)||a.id-b.id);const disabled=g.enabled?'disabled':'';
+-$('#detail').innerHTML=`<div class="toolbar between"><h2>${esc(g.name)}</h2><span class="pill ${g.enabled?'good':''}">${g.enabled?'自动切换运行中':'自动切换已暂停'}</span></div><p class="hint">newapi 分组：${esc(g.newapi_group)}<br>测试模型 gpt-6.1-sol。优先级越大越优先，同优先级按渠道 ID 从小到大。高优先级恢复后约 60 秒回切。</p><div class="toolbar"><button class="primary" data-action="activate">启用并选优</button><button data-action="pause" ${g.enabled?'':'disabled'}>暂停</button><button data-action="restore">恢复接管前状态</button><button data-action="rename">重命名</button><button class="danger" data-action="delete">删除</button></div><h3 class="section-title">渠道与优先级</h3><div class="toolbar"><input id="id-select" class="inline-id" placeholder="渠道 ID，如 48,54" aria-label="按渠道ID勾选" ${disabled}><button data-action="ids" ${disabled}>按 ID 勾选</button><button class="primary" data-action="save" ${disabled}>保存配置</button></div><p class="hint">先保存配置，再启用并选优。修改配置时请暂停；恢复接管前状态会撤销此分组的启停变更。</p><div class="channel labels"><span></span><span>渠道 / 地址 / 实际状态</span><span>优先级</span><span>最近测试</span><span>操作</span></div>${channels.length?channels.map(c=>{const t=state.tests[c.id];return `<div class="channel"><input aria-label="管理渠道${c.id}" type="checkbox" data-cid="${c.id}" ${chosen.has(c.id)?'checked':''} ${disabled}><div><div class="name">#${c.id} ${esc(c.name)}</div><small>${esc(c.base_url)}</small><span class="${c.status===1?'good':'bad'}">${c.status===1?'已启用':'已禁用'}</span>${c.id===g.current_channel_id?' · 当前选中':''}</div><input class="priority" type="number" step="1" data-priority="${c.id}" value="${chosen.get(c.id)??0}" aria-label="渠道${c.id}优先级" ${disabled}><div class="result ${t?(t.success?'good':'bad'):''}">${t?(t.success?'测试成功':'测试失败'):'未测试'}${t?`<small>${t.status_code??'网络错误'} · ${(t.elapsed_ms/1000).toFixed(2)}秒</small>`:''}</div><button data-test="${c.id}">测试</button></div>`}).join(''):'<div class="empty">该分组暂无单一分组渠道</div>'}`}
+-function renderEvents(events){const names={'503':'检测到503',test:'渠道测试',switched:'渠道切换',unavailable:'暂无可用候选',restored:'恢复状态',error:'巡检异常'};$('#event-list').innerHTML=events.length?events.map(e=>{const p=e.payload;return `<div class="event"><time>${new Date(e.created_at*1000).toLocaleString('zh-CN',{hour12:false})}</time><strong class="${p.success===false?'bad':p.type==='switched'?'good':''}">${esc(names[p.type]||p.type)}</strong><div>${esc(p.group_name||'')} ${p.type==='switched'?`#${p.previous_channel_id??p.failed_channel_id??'-'} → #${p.active_channel_id}`:p.candidate_channel_id?`#${p.candidate_channel_id} · HTTP ${p.status_code??'-'} · ${((p.elapsed_ms??0)/1000).toFixed(2)}秒`:esc(p.detail||'')} <small>${esc(p.reason||'')}</small></div></div>`}).join(''):'<div class="empty">暂无记录。启用分组后会记录测试和切换。</div>'}
+-$('#groups').addEventListener('click',e=>{const btn=e.target.closest('[data-select]');if(!btn)return;if(dirty&&!confirm('当前有未保存的配置，确定切换分组？'))return;dirty=false;state.selected=+btn.dataset.select;renderGroups();renderDetail()});
+-$('#detail').addEventListener('input',()=>dirty=true);
+-$('#detail').addEventListener('click',async e=>{const btn=e.target.closest('button');if(!btn)return;const g=selected();if(!g)return;await busy(btn,async()=>{if(btn.dataset.test){notice('正在测试 gpt-6.1-sol，请稍候…');const r=await api('test-channel',{channel_id:+btn.dataset.test});state.tests[r.channel_id]={...r,created_at:Date.now()/1000};notice(`#${r.channel_id} ${r.success?'测试成功':'测试失败'}，HTTP ${r.status_code??'网络错误'}，${(r.elapsed_ms/1000).toFixed(2)}秒`);if(!dirty)renderDetail();return}
++$('#detail').innerHTML=`<div class="toolbar between"><h2>${esc(g.name)}</h2><span class="pill ${g.enabled?'good':''}">${g.enabled?'自动切换运行中':'自动切换已暂停'}</span></div><p class="hint">newapi 分组：${esc(g.newapi_group)}<br>测试模型 gpt-6.1-sol。优先级越大越优先，同优先级按渠道 ID 从小到大。高优先级恢复后约 60 秒回切。</p><div class="toolbar"><button class="primary" data-action="activate">启用并选优</button><button data-action="pause" ${g.enabled?'':'disabled'}>暂停</button><button data-action="restore">恢复接管前状态</button><button data-action="rename">重命名</button><button class="danger" data-action="delete">删除</button></div><h3 class="section-title">503 切换规则</h3><form id="error-rule-form"><div class="toolbar"><label class="field">统计窗口（秒）<input id="error-window" type="number" min="1" max="86400" step="1" required value="${g.error_window_seconds}" aria-describedby="error-rule-hint"></label><label class="field">触发次数<input id="error-threshold" type="number" min="1" max="10000" step="1" required value="${g.error_threshold}" aria-describedby="error-rule-hint"></label><button class="primary" type="submit">保存切换规则</button></div><p class="hint" id="error-rule-hint">仅统计本分组当前渠道：滚动 ${g.error_window_seconds} 秒内累计 ${g.error_threshold} 次 503 才测试并切换。同一请求的重复日志只计一次。保存后立即生效并重新计数；次数设为 1 时遇到一次即触发。</p></form><h3 class="section-title">渠道与优先级</h3><div class="toolbar"><input id="id-select" class="inline-id" placeholder="渠道 ID，如 48,54" aria-label="按渠道ID勾选" ${disabled}><button data-action="ids" ${disabled}>按 ID 勾选</button><button class="primary" data-action="save" ${disabled}>保存配置</button></div><p class="hint">先保存配置，再启用并选优。修改配置时请暂停；恢复接管前状态会撤销此分组的启停变更。</p><div class="channel labels"><span></span><span>渠道 / 地址 / 实际状态</span><span>优先级</span><span>最近测试</span><span>操作</span></div>${channels.length?channels.map(c=>{const t=state.tests[c.id];return `<div class="channel"><input aria-label="管理渠道${c.id}" type="checkbox" data-cid="${c.id}" ${chosen.has(c.id)?'checked':''} ${disabled}><div><div class="name">#${c.id} ${esc(c.name)}</div><small>${esc(c.base_url)}</small><span class="${c.status===1?'good':'bad'}">${c.status===1?'已启用':'已禁用'}</span>${c.id===g.current_channel_id?' · 当前选中':''}</div><input class="priority" type="number" step="1" data-priority="${c.id}" value="${chosen.get(c.id)??0}" aria-label="渠道${c.id}优先级" ${disabled}><div class="result ${t?(t.success?'good':'bad'):''}">${t?(t.success?'测试成功':'测试失败'):'未测试'}${t?`<small>${t.status_code??'网络错误'} · ${(t.elapsed_ms/1000).toFixed(2)}秒</small>`:''}</div><button data-test="${c.id}">测试</button></div>`}).join(''):'<div class="empty">该分组暂无单一分组渠道</div>'}`}
++function renderEvents(events){const names={'503':'检测到503',test:'渠道测试',switched:'渠道切换',unavailable:'暂无可用候选',restored:'恢复状态',error:'巡检异常',rule_updated:'规则已更新'};$('#event-list').innerHTML=events.length?events.map(e=>{const p=e.payload;return `<div class="event"><time>${new Date(e.created_at*1000).toLocaleString('zh-CN',{hour12:false})}</time><strong class="${p.success===false?'bad':p.type==='switched'?'good':''}">${esc(names[p.type]||p.type)}</strong><div>${esc(p.group_name||'')} ${p.type==='switched'?`#${p.previous_channel_id??p.failed_channel_id??'-'} → #${p.active_channel_id}`:p.candidate_channel_id?`#${p.candidate_channel_id} · HTTP ${p.status_code??'-'} · ${((p.elapsed_ms??0)/1000).toFixed(2)}秒`:esc((p.type==='503'&&p.error_threshold?`#${p.failed_channel_id} · ${p.error_window_seconds}秒内 ${p.error_count}/${p.error_threshold} 次 · ${p.triggered?'已达到切换阈值':'继续观察'} · `:'')+(p.detail||''))} <small>${esc(p.reason||'')}</small></div></div>`}).join(''):'<div class="empty">暂无记录。启用分组后会记录测试和切换。</div>'}
++$('#groups').addEventListener('click',e=>{const btn=e.target.closest('[data-select]');if(!btn)return;if((dirty||ruleDirty)&&!confirm('当前有未保存的配置，确定切换分组？'))return;dirty=false;ruleDirty=false;state.selected=+btn.dataset.select;renderGroups();renderDetail()});
++$('#detail').addEventListener('input',e=>{if(e.target.closest('#error-rule-form'))ruleDirty=true;else dirty=true});
++$('#detail').addEventListener('submit',async e=>{if(e.target.id!=='error-rule-form')return;e.preventDefault();const g=selected();if(!g)return;const windowInput=$('#error-window'),thresholdInput=$('#error-threshold');if(!windowInput.reportValidity()||!thresholdInput.reportValidity())return;await busy(e.submitter,async()=>{const updated=await api(`groups/${g.id}/error-rule`,{error_window_seconds:Number(windowInput.value),error_threshold:Number(thresholdInput.value)});Object.assign(g,updated);ruleDirty=false;$('#error-rule-hint').textContent=`已生效：本分组当前渠道在滚动 ${updated.error_window_seconds} 秒内累计 ${updated.error_threshold} 次 503 才切换，计数已重置。`;notice('本分组切换规则已保存并立即生效');await load()})});
++$('#detail').addEventListener('click',async e=>{const btn=e.target.closest('button');if(!btn||btn.closest('#error-rule-form'))return;const g=selected();if(!g)return;await busy(btn,async()=>{if(btn.dataset.test){notice('正在测试 gpt-6.1-sol，请稍候…');const r=await api('test-channel',{channel_id:+btn.dataset.test});state.tests[r.channel_id]={...r,created_at:Date.now()/1000};notice(`#${r.channel_id} ${r.success?'测试成功':'测试失败'}，HTTP ${r.status_code??'网络错误'}，${(r.elapsed_ms/1000).toFixed(2)}秒`);if(!dirty&&!ruleDirty)renderDetail();return}
+ const action=btn.dataset.action;
+ if(action==='ids'){const ids=$('#id-select').value.split(/[,，\s]+/).filter(Boolean).map(Number);const found=new Set([...document.querySelectorAll('[data-cid]')].map(c=>+c.dataset.cid));if(ids.some(id=>!found.has(id)))throw Error('包含不属于本分组的渠道 ID');for(const el of document.querySelectorAll('[data-cid]'))el.checked=ids.includes(+el.dataset.cid);dirty=true;return}
+ if(action==='save'){const rows=[...document.querySelectorAll('[data-cid]:checked')].map(el=>({channel_id:+el.dataset.cid,priority:Number(document.querySelector(`[data-priority="${el.dataset.cid}"]`).value)}));await api(`groups/${g.id}/channels`,{channels:rows});notice('配置已保存');dirty=false}
+-if(action==='activate'){if(dirty)throw Error('请先保存配置');notice('正在按优先级测试候选渠道…');const r=await api(`groups/${g.id}/activate`,{});notice(r.success?`已选中渠道 #${r.active_channel_id}`:'候选测试失败，保留当前渠道')}
++if(action==='activate'){if(dirty||ruleDirty)throw Error('请先保存配置和切换规则');notice('正在按优先级测试候选渠道…');const r=await api(`groups/${g.id}/activate`,{});notice(r.success?`已选中渠道 #${r.active_channel_id}`:'候选测试失败，保留当前渠道')}
+ if(action==='pause'){await api(`groups/${g.id}`,{enabled:false});notice('自动切换已暂停')}
+-if(action==='restore'){if(!confirm('恢复该分组接管前的渠道启停状态，并暂停自动切换？'))return;await api(`groups/${g.id}/restore`,{});dirty=false;notice('已恢复接管前状态')}
++if(action==='restore'){if(!confirm('恢复该分组接管前的渠道启停状态，并暂停自动切换？'))return;await api(`groups/${g.id}/restore`,{});dirty=false;ruleDirty=false;notice('已恢复接管前状态')}
+ if(action==='rename'){const name=prompt('分组名称',g.name);if(name)await api(`groups/${g.id}`,{name})}
+-if(action==='delete'){if(g.enabled)throw Error('请先暂停或恢复');if(!confirm('删除分组配置？渠道启停状态将保留。'))return;await api(`groups/${g.id}`,undefined,'DELETE');dirty=false;state.selected=null}
++if(action==='delete'){if(g.enabled)throw Error('请先暂停或恢复');if(!confirm('删除分组配置？渠道启停状态将保留。'))return;await api(`groups/${g.id}`,undefined,'DELETE');dirty=false;ruleDirty=false;state.selected=null}
+ await load()})});
+ $('#new-group').onclick=()=>{const groups=[...new Set(state.channels.map(c=>c.group).filter(s=>s&&!s.includes(',')))];$('#create-target').innerHTML=groups.map(g=>`<option value="${esc(g)}">${esc(g)}</option>`).join('');$('#create-dialog').showModal();$('#create-name').focus()};
+ $('#cancel-create').onclick=()=>$('#create-dialog').close();
+-$('#create-form').onsubmit=async e=>{e.preventDefault();await busy(e.submitter,async()=>{const g=await api('groups',{name:$('#create-name').value,newapi_group:$('#create-target').value});$('#create-dialog').close();state.selected=g.id;dirty=false;await load()})};
++$('#create-form').onsubmit=async e=>{e.preventDefault();await busy(e.submitter,async()=>{const g=await api('groups',{name:$('#create-name').value,newapi_group:$('#create-target').value});$('#create-dialog').close();state.selected=g.id;dirty=false;ruleDirty=false;await load()})};
+ $('#refresh').onclick=()=>load();load();setInterval(load,10000);
+ </script>
+ </body></html>
+diff --git a/tests/test_core.py b/tests/test_core.py
+index 4d56319..6616462 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -8,7 +8,7 @@ class TestCore(unittest.TestCase):
+     def setUp(self):
+         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+         self.store=ConfigStore(str(Path(self.tmp.name)/'config.db'))
+-        self.group=self.store.create_group('GPT','GPT')
++        self.group=self.store.create_group('GPT','GPT',error_threshold=1)
+         self.repo=MemoryRepository([Channel(48,'A',1,'GPT',1,1),Channel(54,'B',2,'GPT',1,1),Channel(55,'C',2,'GPT',1,1)])
+         self.store.replace_candidates(self.group['id'],[{'channel_id':48,'priority':100},{'channel_id':54,'priority':80},{'channel_id':55,'priority':50}])
+         self.store.set_current(self.group['id'],48);self.store.update_group(self.group['id'],enabled=True)
+diff --git a/tests/test_error_rule.py b/tests/test_error_rule.py
+new file mode 100644
+index 0000000..57614d3
+--- /dev/null
++++ b/tests/test_error_rule.py
+@@ -0,0 +1,149 @@
++import base64
++import json
++import os
++import sqlite3
++import tempfile
++import threading
++import unittest
++import urllib.error
++import urllib.request
++from http.server import ThreadingHTTPServer
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from src.app import Handler
++from src.core import CandidateResult, Channel, LogWatcher, MemoryRepository, SwitchEngine
++from src.store import ConfigStore
++
++
++class TestErrorRule(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.root = Path(self.tmp.name)
++        self.store = ConfigStore(str(self.root / 'config.db'))
++        self.addCleanup(self.store.conn.close)
++        self.repo = MemoryRepository([Channel(i, str(i), 1 if i % 2 else 2, str((i-1)//2), 1, 1) for i in range(1, 5)])
++        self.calls, self.events = [], []
++        def tester(channel):
++            self.calls.append(channel.id)
++            return CandidateResult(channel.id, 200, 1, True, 'ok')
++        self.engine = SwitchEngine(self.repo, self.store, tester, self.events.append)
++        self.gid = self.make_group('first', 1, 2)
++
++    def make_group(self, name, active, backup):
++        g = self.store.create_group(name, name)
++        self.store.replace_candidates(g['id'], [{'channel_id': active, 'priority': 10}, {'channel_id': backup, 'priority': 1}])
++        self.store.set_current(g['id'], active)
++        self.store.update_group(g['id'], enabled=True)
++        return g['id']
++
++    def test_third_error_triggers_and_does_not_cooldown_early(self):
++        for t in (100, 102):
++            self.assertEqual(self.engine.handle_503(1, '503', occurred_at=t), [])
++            self.assertEqual(self.calls, [])
++            self.assertNotIn(1, self.engine._failed_until)
++        self.engine.handle_503(1, '503', occurred_at=105)
++        self.assertEqual(self.calls, [2])
++        self.assertEqual(self.store.get_group(self.gid)['current_channel_id'], 2)
++        self.assertEqual([e['error_count'] for e in self.events if e['type'] == '503'], [1, 2, 3])
++        self.assertNotIn(self.gid, self.engine._error_windows)
++
++    def test_expired_errors_are_removed(self):
++        for t in (100, 103, 106): self.engine.handle_503(1, '503', occurred_at=t)
++        self.assertEqual(self.calls, [])
++        self.assertEqual(self.events[-1]['error_count'], 2)
++        self.engine.handle_503(1, '503', occurred_at=107)
++        self.assertEqual(self.calls, [2])
++
++    def test_groups_use_independent_rules_and_counters(self):
++        second = self.make_group('second', 3, 4)
++        self.store.update_group(second, error_window_seconds=10, error_threshold=2)
++        self.engine.handle_503(1, '503', occurred_at=100)
++        self.engine.handle_503(3, '503', occurred_at=100)
++        self.engine.handle_503(1, '503', occurred_at=101)
++        self.assertEqual(self.calls, [])
++        self.engine.handle_503(3, '503', occurred_at=109)
++        self.assertEqual(self.calls, [4])
++        self.assertEqual(self.store.get_group(self.gid)['current_channel_id'], 1)
++
++    def test_new_current_channel_starts_fresh(self):
++        for t in (100, 101, 102): self.engine.handle_503(1, '503', occurred_at=t)
++        self.engine.handle_503(1, 'late', occurred_at=103)
++        self.engine.handle_503(2, '503', occurred_at=103)
++        self.assertEqual(self.events[-1]['error_count'], 1)
++        self.assertEqual(self.calls, [2])
++
++    def test_rule_change_restarts_counting(self):
++        self.engine.handle_503(1, '503', occurred_at=100)
++        self.store.update_group(self.gid, error_threshold=2)
++        self.engine.handle_503(1, '503', occurred_at=101)
++        self.assertEqual(self.calls, [])
++        self.engine.handle_503(1, '503', occurred_at=102)
++        self.assertEqual(self.calls, [2])
++
++    def test_threshold_one_restores_immediate_behavior(self):
++        self.store.update_group(self.gid, error_threshold=1)
++        self.engine.handle_503(1, '503', occurred_at=100)
++        self.assertEqual(self.calls, [2])
++
++    def test_log_timestamps_and_duplicate_records(self):
++        watcher = LogWatcher(self.root, self.engine.handle_503)
++        watcher.poll_once()
++        path = self.root / 'oneapi-test.log'
++        def append(second, request_id):
++            prefix = f'[ERR] 2026/11/14 - 09:00:{second:02d} | {request_id} | '
++            with path.open('a') as f:
++                f.write(prefix + 'channel error (channel #1, status code: 503): unavailable\n')
++                f.write(prefix.replace('[ERR]', '[INFO]') + 'record error log: channelId=1, content=status_code=503, unavailable\n')
++        # 同一轮读取不等于同一时间窗口：以日志实际时间计算。
++        append(0, 'request-a'); append(3, 'request-b'); append(6, 'request-c')
++        watcher.poll_once()
++        self.assertEqual(self.calls, [])
++        self.assertEqual([e['error_count'] for e in self.events], [1, 2, 2])
++        append(7, 'request-d'); watcher.poll_once()
++        self.assertEqual(self.calls, [2])
++
++    def test_rule_validation_and_persistence(self):
++        for value in (0, -1, 1.5, True, None, '3', 10001):
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                self.store.update_group(self.gid, error_threshold=value)
++        for value in (0, True, None, 86401):
++            with self.subTest(value=value), self.assertRaises(ValueError):
++                self.store.update_group(self.gid, error_window_seconds=value)
++        self.store.update_group(self.gid, error_window_seconds=12, error_threshold=7)
++        reopened = ConfigStore(str(self.root / 'config.db'))
++        self.addCleanup(reopened.conn.close)
++        self.assertEqual(reopened.get_group(self.gid)['error_threshold'], 7)
++        self.assertEqual(reopened.get_group(self.gid)['error_window_seconds'], 12)
++
++    def test_existing_database_migration_keeps_group_state(self):
++        path = self.root / 'old.db'
++        with sqlite3.connect(path) as conn:
++            conn.execute('CREATE TABLE groups_config(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL, current_channel_id INTEGER, created_at INTEGER NOT NULL, newapi_group TEXT NOT NULL)')
++            conn.execute("INSERT INTO groups_config VALUES(9,'existing',1,123,100,'GPT')")
++        migrated = ConfigStore(str(path))
++        self.addCleanup(migrated.conn.close)
++        self.assertEqual(migrated.get_group(9), dict(id=9,name='existing',enabled=1,current_channel_id=123,created_at=100,newapi_group='GPT',error_window_seconds=5,error_threshold=3))
++
++    def test_http_rule_update_validation_and_reset(self):
++        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
++        server.service = SimpleNamespace(store=self.store, engine=self.engine, record_event=self.events.append)
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
++        url = f'http://127.0.0.1:{server.server_port}/api/groups/{self.gid}/error-rule'
++        def post(body):
++            return urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(), headers={'Content-Type':'application/json', 'Authorization':'Basic '+base64.b64encode(b'root:test').decode()}))
++        with patch.dict(os.environ, ADMIN_USER='root', ADMIN_PASSWORD='test'):
++            self.engine.handle_503(1, '503', occurred_at=100)
++            with post({'error_window_seconds':5,'error_threshold':3}) as response:
++                self.assertEqual(json.load(response)['error_threshold'], 3)
++            self.assertNotIn(self.gid, self.engine._error_windows)
++            self.assertEqual(self.store.get_group(self.gid)['enabled'], 1)
++            for body in ({'error_window_seconds':5}, {'error_window_seconds':5,'error_threshold':None}):
++                with self.assertRaises(urllib.error.HTTPError) as ctx: post(body)
++                self.assertEqual(ctx.exception.code, 400)
++
++
++if __name__ == '__main__': unittest.main()

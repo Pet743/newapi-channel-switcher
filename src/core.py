@@ -4,12 +4,15 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
 ERROR_RE = re.compile(r"record error log:.*?channelId=(\d+).*?content=status_code=503(?:\D|$)(.*)")
 CHANNEL_ERROR_RE = re.compile(r"channel error \(channel #(\d+), status code: 503\):\s*(.*)")
+LOG_CONTEXT_RE = re.compile(r'^\[\w+\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2})\s*\|\s*([^|]+?)\s*\|')
 
 @dataclass(frozen=True)
 class Channel:
@@ -46,6 +49,18 @@ class LogParser:
         match = ERROR_RE.search(line) or CHANNEL_ERROR_RE.search(line)
         return (int(match[1]), match[2].strip()) if match else None
 
+    @staticmethod
+    def context(line):
+        match = LOG_CONTEXT_RE.search(line)
+        if not match: return None, None
+        try:
+            # 日志时区不影响滚动窗口的时间差；统一解析，避免依赖容器时区。
+            timestamp = datetime.strptime(match[1], '%Y/%m/%d - %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None, None
+        request_id = match[2].strip()
+        return timestamp, request_id if request_id and request_id != '-' else None
+
 class LogWatcher:
     """首次跳过历史；新文件从头读；只处理已完整写入的行。"""
     def __init__(self, directory, on_503, interval=1.0):
@@ -55,6 +70,7 @@ class LogWatcher:
         self._offsets = {}
         self._initialized = False
         self._thread = None
+        self._seen_requests = OrderedDict()
 
     def start(self):
         self.poll_once()
@@ -91,9 +107,19 @@ class LogWatcher:
                     if not line or not line.endswith(b"\n"): break
                     # 故障切换失败仍消费本行，由定时探测重试，避免不停重放。
                     self._offsets[key] = fh.tell()
-                    parsed = LogParser.parse(line.decode("utf-8", "replace"))
+                    text = line.decode("utf-8", "replace")
+                    parsed = LogParser.parse(text)
                     if parsed:
-                        try: self.on_503(*parsed)
+                        timestamp, request_id = LogParser.context(text)
+                        # 同一请求的 channel error / record error log 只统计一次。
+                        if request_id:
+                            request_key = (parsed[0], request_id)
+                            if request_key in self._seen_requests: continue
+                            self._seen_requests[request_key] = None
+                            if len(self._seen_requests) > 50000: self._seen_requests.popitem(last=False)
+                        try:
+                            if timestamp is None: self.on_503(*parsed)
+                            else: self.on_503(*parsed, occurred_at=timestamp)
                         except Exception: logging.exception("503 事件处理失败")
                 self._offsets.setdefault(key, offset)
         self._offsets = {k: v for k, v in self._offsets.items() if k in live}
@@ -106,6 +132,10 @@ class SwitchEngine:
         self.lock = threading.RLock()
         self._lock = self.lock
         self._failed_until = {}
+        self._error_windows = {}
+
+    def reset_error_window(self, group_id):
+        with self.lock: self._error_windows.pop(group_id, None)
 
     def _test(self, group, channel, reason):
         result = self.tester(channel)
@@ -136,6 +166,7 @@ class SwitchEngine:
             if not result.success: continue
             self.repository.set_active(ids, cid)
             self.config_store.set_current(group["id"], cid)
+            if cid != current: self.reset_error_window(group["id"])
             self.config_store.update_group(group["id"], enabled=True)
             event = {"type": "switched", "group_id": group["id"], "group_name": group["name"],
                      "failed_channel_id": excluded, "previous_channel_id": current,
@@ -149,16 +180,32 @@ class SwitchEngine:
                          "reason": reason, "success": False, "detail": "候选渠道全部测试失败，保留当前状态，等待下一轮探测"})
         return {"success": False, "active_channel_id": current, "changed": False}
 
-    def handle_503(self, channel_id, message):
+    def handle_503(self, channel_id, message, occurred_at=None):
         results = []
         with self.lock:
             for group in self.config_store.groups_for_channel(channel_id):
                 # 忽略旧请求/备用渠道迟到的错误，不覆盖正在使用的成功渠道。
                 if group["current_channel_id"] != channel_id: continue
-                self._failed_until[channel_id] = time.time() + self.cooldown
+                window, threshold = group['error_window_seconds'], group['error_threshold']
+                signature = (channel_id, window, threshold)
+                state = self._error_windows.get(group['id'])
+                if state is None or state['signature'] != signature:
+                    state = {'signature': signature, 'times': []}
+                    self._error_windows[group['id']] = state
+                timestamp = time.time() if occurred_at is None else occurred_at
+                latest = max(timestamp, max(state['times'], default=timestamp))
+                state['times'] = [t for t in state['times'] if t >= latest - window]
+                if timestamp >= latest - window: state['times'].append(timestamp)
+                count = len(state['times'])
+                triggered = count >= threshold
                 self.event_sink({"type": "503", "group_id": group["id"], "group_name": group["name"],
-                                 "failed_channel_id": channel_id, "detail": message})
-                results.append(self._choose(group, "检测到503", excluded=channel_id))
+                                 "failed_channel_id": channel_id, "detail": message,
+                                 "error_count": count, "error_threshold": threshold,
+                                 "error_window_seconds": window, "triggered": triggered})
+                if not triggered: continue
+                self.reset_error_window(group['id'])
+                self._failed_until[channel_id] = time.time() + self.cooldown
+                results.append(self._choose(group, f'{window}秒内503达到{threshold}次', excluded=channel_id))
         return results
 
     def activate_best(self, group_id):
@@ -166,6 +213,7 @@ class SwitchEngine:
             group = self.config_store.get_group(group_id)
             if not group: raise ValueError("分组不存在")
             if not self.config_store.candidates(group_id): raise ValueError("请先保存渠道配置")
+            self.reset_error_window(group_id)
             self.config_store.update_group(group_id, enabled=True)
             return self._choose(group, "启用配置", force=True)
 
@@ -184,6 +232,7 @@ class SwitchEngine:
             if not snapshot: raise ValueError("该分组没有接管快照")
             self.repository.restore_statuses(snapshot)
             self.config_store.update_group(group_id, enabled=False)
+            self.reset_error_window(group_id)
             self.event_sink({"type": "restored", "group_id": group_id, "detail": "恢复接管前的渠道状态并暂停自动切换"})
 
 class MemoryRepository:

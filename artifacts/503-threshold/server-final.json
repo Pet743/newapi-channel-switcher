@@ -1,0 +1,5 @@
+{
+  "stdout": "{\"group_id\":3,\"name\":\"gpt\",\"error_window_seconds\":5,\"error_threshold\":3,\"enabled\":1,\"current_channel_id\":48,\"html_rule_form\":true,\"save_rule_status\":200}\ninvalid_threshold_status=400\n60f78fe54f5313b6c9a48988d4ec9cb3793813a221aeb09c6f985e8df9f59f8a  src/core.py\n60f78fe54f5313b6c9a48988d4ec9cb3793813a221aeb09c6f985e8df9f59f8a  artifacts/503-threshold/MODIFIED_FILE\nrunning healthy\n",
+  "stderr": "----------------------------------------------------------------------\nRan 29 tests in 5.331s\n\nOK\n",
+  "exit": 0
+}
