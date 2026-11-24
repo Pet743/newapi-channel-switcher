@@ -46,11 +46,10 @@ class PostgresChannelRepository:
             with conn.cursor() as cur:
                 cur.execute("SELECT id FROM channels WHERE id = ANY(%s) FOR UPDATE", (channel_ids,))
                 found = {int(row[0]) for row in cur.fetchall()}
-                missing = set(channel_ids) - found
-                if missing:
-                    raise ValueError(f"渠道不存在: {sorted(missing)}")
+                # 已删除的备用渠道不能阻断健康渠道接管；目标必须仍在锁定的分组内。
                 if active_id not in found:
-                    raise ValueError("目标渠道不在分组")
+                    raise ValueError("目标渠道不存在或不在分组")
+                channel_ids = sorted(found)
                 cur.execute("UPDATE channels SET status=2 WHERE id = ANY(%s)", (channel_ids,))
                 cur.execute("UPDATE channels SET status=1 WHERE id=%s", (active_id,))
                 cur.execute("UPDATE abilities SET enabled=(channel_id=%s) WHERE channel_id = ANY(%s)", (active_id, channel_ids))

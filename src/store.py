@@ -4,6 +4,8 @@ import threading
 import time
 from pathlib import Path
 
+_UNSET = object()
+
 class ConfigStore:
     def __init__(self, path="data/config.db"):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -24,6 +26,9 @@ class ConfigStore:
         cols = {r[1] for r in self.conn.execute('PRAGMA table_info(groups_config)')}
         if 'newapi_group' not in cols:
             self.conn.execute("ALTER TABLE groups_config ADD COLUMN newapi_group TEXT NOT NULL DEFAULT ''")
+        for column, default in (('error_window_seconds', 5), ('error_threshold', 3)):
+            if column not in cols:
+                self.conn.execute(f'ALTER TABLE groups_config ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}')
         self.conn.commit()
 
     def groups(self):
@@ -32,15 +37,31 @@ class ConfigStore:
         with self.lock:
             r = self.conn.execute('SELECT * FROM groups_config WHERE id=?', (gid,)).fetchone()
             return dict(r) if r else None
-    def create_group(self, name, newapi_group=''):
+    @staticmethod
+    def validate_error_rule(error_window_seconds, error_threshold):
+        for value, limit, label in ((error_window_seconds, 86400, '503统计窗口（秒）'),
+                                    (error_threshold, 10000, '503触发次数')):
+            if type(value) is not int or not 1 <= value <= limit:
+                raise ValueError(f'{label}必须是1～{limit}的整数')
+
+    def create_group(self, name, newapi_group='', error_window_seconds=5, error_threshold=3):
         if not name.strip() or len(name) > 128: raise ValueError('分组名称需为1～128个字符')
+        self.validate_error_rule(error_window_seconds, error_threshold)
         with self.lock, self.conn:
             if newapi_group and self.conn.execute('SELECT 1 FROM groups_config WHERE newapi_group=?',(newapi_group,)).fetchone():
                 raise ValueError('该newapi分组已有管理配置，请编辑已有分组')
-            cur = self.conn.execute('INSERT INTO groups_config(name,newapi_group,enabled,created_at) VALUES(?,?,0,?)', (name.strip(),newapi_group,int(time.time())))
+            cur = self.conn.execute('INSERT INTO groups_config(name,newapi_group,enabled,created_at,error_window_seconds,error_threshold) VALUES(?,?,0,?,?,?)',
+                                    (name.strip(),newapi_group,int(time.time()),error_window_seconds,error_threshold))
             return self.get_group(cur.lastrowid)
-    def update_group(self, gid, name=None, enabled=None):
+    def update_group(self, gid, name=None, enabled=None, error_window_seconds=_UNSET, error_threshold=_UNSET):
         fields, values = [], []
+        rule = {k: v for k, v in (('error_window_seconds', error_window_seconds), ('error_threshold', error_threshold)) if v is not _UNSET}
+        if rule:
+            current = self.get_group(gid)
+            if not current: raise ValueError('分组不存在')
+            self.validate_error_rule(rule.get('error_window_seconds', current['error_window_seconds']),
+                                     rule.get('error_threshold', current['error_threshold']))
+            for key, value in rule.items(): fields.append(key+'=?'); values.append(value)
         if name is not None:
             if not name.strip(): raise ValueError('名称不能为空')
             fields.append('name=?'); values.append(name.strip())

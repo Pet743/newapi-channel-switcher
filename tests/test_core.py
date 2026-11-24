@@ -8,7 +8,7 @@ class TestCore(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.store=ConfigStore(str(Path(self.tmp.name)/'config.db'))
-        self.group=self.store.create_group('GPT','GPT')
+        self.group=self.store.create_group('GPT','GPT',error_threshold=1)
         self.repo=MemoryRepository([Channel(48,'A',1,'GPT',1,1),Channel(54,'B',2,'GPT',1,1),Channel(55,'C',2,'GPT',1,1)])
         self.store.replace_candidates(self.group['id'],[{'channel_id':48,'priority':100},{'channel_id':54,'priority':80},{'channel_id':55,'priority':50}])
         self.store.set_current(self.group['id'],48);self.store.update_group(self.group['id'],enabled=True)

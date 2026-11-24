@@ -1,0 +1,51 @@
+{
+  "verified_at_beijing": "2026-11-25T02:01:30.662646+08:00",
+  "image": "newapi-channel-switcher:20261125-log503-fields",
+  "container_image_id": "sha256:3d6e05bc631aadec771059215311f750faabb2f57c12f344b0125eee69a69699",
+  "core_sha256": "22459f8c942230f0452bac960ae6efb97b401d36eac639e4a090ad61be66f239",
+  "health": {
+    "ok": true,
+    "service": "newapi渠道切换"
+  },
+  "newapi_not_restarted": true,
+  "group_config_preserved": true,
+  "groups": [
+    {
+      "id": 3,
+      "name": "gpt",
+      "enabled": 1,
+      "current_channel_id": 75,
+      "created_at": 1791653618,
+      "newapi_group": "Gpt稳定分组（推荐）备用线路！",
+      "error_window_seconds": 10,
+      "error_threshold": 3,
+      "channels": [
+        {
+          "group_id": 3,
+          "channel_id": 75,
+          "priority": 10
+        },
+        {
+          "group_id": 3,
+          "channel_id": 48,
+          "priority": 9
+        },
+        {
+          "group_id": 3,
+          "channel_id": 73,
+          "priority": 5
+        },
+        {
+          "group_id": 3,
+          "channel_id": 59,
+          "priority": 4
+        },
+        {
+          "group_id": 3,
+          "channel_id": 66,
+          "priority": 1
+        }
+      ]
+    }
+  ]
+}

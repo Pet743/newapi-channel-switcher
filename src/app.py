@@ -26,7 +26,7 @@ class Service:
         self.worker = None
 
     def record_event(self, event): self.store.add_event(json.dumps(event, ensure_ascii=False))
-    def on_503(self, cid, message): self.engine.handle_503(cid,message)
+    def on_503(self, cid, message, occurred_at=None): self.engine.handle_503(cid,message,occurred_at=occurred_at)
     def start(self):
         self.watcher.start()
         self.worker = threading.Thread(target=self._periodic,daemon=True,name='recovery-worker')
@@ -97,7 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                 data=(STATIC/'index.html').read_bytes();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(data);return
             if path=='/api/groups':
                 groups=store.groups()
-                for g in groups: g['channels']=store.candidates(g['id'])
+                live_ids = {c.id for c in service.repository.get_channels()}
+                for g in groups: g['channels']=[r for r in store.candidates(g['id']) if r['channel_id'] in live_ids]
                 return self._json(200,{'groups':groups})
             if path=='/api/channels': return self._json(200,{'channels':[c.public() for c in service.repository.get_channels()],'tests':store.test_results()})
             if path=='/api/events': return self._json(200,{'events':store.recent_events()})
@@ -112,19 +113,31 @@ class Handler(BaseHTTPRequestHandler):
                 if path=='/api/groups':
                     newapi_group=str(body.get('newapi_group',''))
                     if not newapi_group: raise ValueError('请选择newapi分组')
-                    return self._json(201,store.create_group(str(body.get('name','')),newapi_group))
+                    return self._json(201,store.create_group(str(body.get('name','')),newapi_group,
+                                                           body.get('error_window_seconds',5),body.get('error_threshold',3)))
                 if path.startswith('/api/groups/'):
                     parts=path.strip('/').split('/');gid=int(parts[2]);g=store.get_group(gid)
                     if not g: return self._json(404,{'error':'分组不存在'})
                     action=parts[3] if len(parts)==4 else None
-                    if action=='channels': return self._json(200,{'channels':service.validate_candidates(gid,body.get('channels'))})
+                    if action=='channels':
+                        channels=service.validate_candidates(gid,body.get('channels'))
+                        service.engine.reset_error_window(gid)
+                        return self._json(200,{'channels':channels})
+                    if action=='error-rule':
+                        rule=store.update_group(gid,error_window_seconds=body['error_window_seconds'],error_threshold=body['error_threshold'])
+                        service.engine.reset_error_window(gid)
+                        service.record_event({'type':'rule_updated','group_id':gid,'group_name':g['name'],
+                                              'detail':f"503切换规则：{rule['error_window_seconds']}秒内达到{rule['error_threshold']}次"})
+                        return self._json(200,rule)
                     if action=='activate':
                         # 所有候选按优先级逐一测试，不直接按指定ID绕过优先级。
                         return self._json(200,service.engine.activate_best(gid))
                     if action=='restore': service.engine.restore(gid);return self._json(200,{'ok':True})
                     if action is None:
                         if body.get('enabled'): raise ValueError('请点击启用并选优以完成测试后启用')
-                        return self._json(200,store.update_group(gid,body.get('name'),body.get('enabled')))
+                        updated=store.update_group(gid,body.get('name'),body.get('enabled'))
+                        if 'enabled' in body: service.engine.reset_error_window(gid)
+                        return self._json(200,updated)
                 if path=='/api/test-channel':
                     cid=int(body['channel_id']);channel=next(iter(service.repository.get_channels([cid])),None)
                     if not channel: return self._json(404,{'error':'渠道不存在'})
@@ -142,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
                 gid=int(path.split('/')[3]);g=service.store.get_group(gid)
                 if not g: return self._json(404,{'error':'分组不存在'})
                 if g['enabled']: raise ValueError('请先暂停或恢复再删除分组')
-                service.store.delete_group(gid);self._json(200,{'ok':True})
+                service.store.delete_group(gid);service.engine.reset_error_window(gid);self._json(200,{'ok':True})
         except ValueError as exc: self._json(400,{'error':str(exc)})
     def log_message(self,fmt,*args): logging.info(fmt,*args)
 
