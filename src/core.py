@@ -10,8 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Protocol
 
-ERROR_RE = re.compile(r"record error log:.*?channelId=(\d+).*?content=status_code=503(?:\D|$)(.*)")
-CHANNEL_ERROR_RE = re.compile(r"channel error \(channel #(\d+), status code: 503\):\s*(.*)")
+# 依赖渠道/状态码字段和结构，不依赖可翻译的日志说明文字。
+ERROR_RE = re.compile(r"\bchannelId=(\d+)\b.*?\bcontent=status_code=503(?:\D|$)(.*)")
+CHANNEL_ERROR_RE = re.compile(r"\([^()\r\n]*#(\d+)\s*[,，][^()\r\n]*?\b503\s*\)\s*[:：]\s*(.*)")
 LOG_CONTEXT_RE = re.compile(r'^\[\w+\]\s+(\d{4}/\d{2}/\d{2} - \d{2}:\d{2}:\d{2})\s*\|\s*([^|]+?)\s*\|')
 
 @dataclass(frozen=True)
@@ -153,6 +154,11 @@ class SwitchEngine:
         rows = self.config_store.candidates(group["id"])
         ids = [int(r["channel_id"]) for r in rows]
         channels = {c.id: c for c in self.repository.get_channels(ids)} if ids else {}
+        # 查询成功后清理已删除候选，保持配置数量与实际渠道一致。
+        if set(ids) - channels.keys():
+            rows = [r for r in rows if int(r["channel_id"]) in channels]
+            self.config_store.replace_candidates(group["id"], rows)
+            ids = [int(r["channel_id"]) for r in rows]
         current = group["current_channel_id"]
         for row in rows:
             cid = int(row["channel_id"])

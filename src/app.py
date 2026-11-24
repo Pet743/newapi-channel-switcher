@@ -97,7 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                 data=(STATIC/'index.html').read_bytes();self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(data);return
             if path=='/api/groups':
                 groups=store.groups()
-                for g in groups: g['channels']=store.candidates(g['id'])
+                live_ids = {c.id for c in service.repository.get_channels()}
+                for g in groups: g['channels']=[r for r in store.candidates(g['id']) if r['channel_id'] in live_ids]
                 return self._json(200,{'groups':groups})
             if path=='/api/channels': return self._json(200,{'channels':[c.public() for c in service.repository.get_channels()],'tests':store.test_results()})
             if path=='/api/events': return self._json(200,{'events':store.recent_events()})
